@@ -31,14 +31,13 @@ namespace AHT10 {
         if (_initialized && _address === addr) return
         _address = addr
 
-        // Soft-Reset (empfohlen nach Power-Up um einen definierten Zustand zu haben)
-        // 0xBA
+        // Soft-Reset (empfohlen nach Power-Up für konsistenten Zustand)
         i2cWrite(_address, [0xBA])
         basic.pause(40)
 
         // Init/Calibrate: 0xE1 0x08 0x00
         i2cWrite(_address, [0xE1, 0x08, 0x00])
-        basic.pause(300) // leicht großzügig
+        basic.pause(300) // leichte Reserve
 
         _initialized = true
     }
@@ -62,10 +61,10 @@ namespace AHT10 {
     function measureAndRead(addr: number): Buffer {
         // Trigger measurement: 0xAC 0x33 0x00
         i2cWrite(addr, [0xAC, 0x33, 0x00])
-        basic.pause(100) // Wartezeit bis Messung typischerweise fertig
+        basic.pause(120) // etwas großzügiger (Calliope/micro:bit stabiler)
 
         // Polling Busy-Bit (Bit7 im Status-Byte) bis frei oder Timeout
-        for (let i = 0; i < 30; i++) {
+        for (let i = 0; i < 40; i++) {
             // Versuche zuerst 7 Bytes (falls CRC vorhanden)
             let buf = i2cRead(addr, 7)
             if (buf.length < 7) {
@@ -85,7 +84,7 @@ namespace AHT10 {
                 return buf // bereits 6 Bytes
             }
 
-            basic.pause(10)
+            basic.pause(12)
         }
 
         // Letzter Rückfall – gib das, was da ist
@@ -114,6 +113,7 @@ namespace AHT10 {
         initOnce(address)
     }
 
+    // (Debug) Status-Byte lesen – im Menü versteckt
     //% blockId=aht10_status block="AHT10 Status-Byte an Adresse %address"
     //% address.defl=0x38 address.min=0 address.max=127
     //% blockHidden=true
@@ -122,11 +122,9 @@ namespace AHT10 {
         return b[0]
     }
 
-    
-//% blockId=aht10_humidity block="AHT10 Luftfeuchtigkeit (%) an Adresse %address"
-//% address.defl=0x38 address.min=0 address.max=127
-//% weight=90
-
+    //% blockId=aht10_humidity block="AHT10 Luftfeuchtigkeit (%) an Adresse %address"
+    //% address.defl=0x38 address.min=0 address.max=127
+    //% weight=90
     export function humidity(address: number = DEFAULT_ADDR): number {
         initOnce(address)
 
@@ -138,7 +136,7 @@ namespace AHT10 {
 
         // 2. Versuch bei unplausiblen Werten (0% oder >100%)
         if (hum <= 0 || hum > 100) {
-            basic.pause(60)
+            basic.pause(100)
             buf = measureAndRead(address)
             raw = parseRaw(buf).rawHum
             hum = (raw * 100) / 1048576
@@ -160,7 +158,7 @@ namespace AHT10 {
 
         // 2. Versuch, wenn offensichtlich unplausibel
         if (tempC < -40 || tempC > 85) {
-            basic.pause(60)
+            basic.pause(100)
             buf = measureAndRead(address)
             raw = parseRaw(buf).rawTemp
             tempC = (raw * 200) / 1048576 - 50
@@ -243,5 +241,51 @@ namespace AHT10 {
         const hum = Math.max(0, Math.min(100, (raw.rawHum * 100) / 1048576))
         const tempC = (raw.rawTemp * 200) / 1048576 - 50
         return { humidity: hum, temperatureC: tempC }
+    }
+
+    // ----------- Optionale Debug-Helfer (sichtbar, falls du willst) -----------
+    // I²C-Scan: listet antwortende Adressen im Serial-Monitor
+    //% blockId=aht10_scan_i2c block="AHT10 I²C-Scan (0..127) und Adressen seriell ausgeben"
+    //% weight=10
+    export function scanI2C(): void {
+        for (let addr = 0; addr < 128; addr++) {
+            let ok = true
+            try {
+                const b = pins.i2cReadBuffer(addr, 1)
+            } catch (e) {
+                ok = false
+            }
+            if (ok) {
+                serial.writeLine("I2C device @ 0x" + addr.toString(16))
+            }
+            basic.pause(2)
+        }
+    }
+
+    // Rohbytes dumpen (Serial) zum Debuggen von Timing/Busy/CRC
+    //% blockId=aht10_dump_raw block="AHT10 Rohbytes dumpen an Adresse %address"
+    //% address.defl=0x38 address.min=0 address.max=127
+    //% weight=9
+    export function dumpRaw(address: number = DEFAULT_ADDR): void {
+        const buf = (function () {
+            pins.i2cWriteBuffer(address, pins.createBufferFromArray([0xAC, 0x33, 0x00]))
+            basic.pause(130)
+            let b = pins.i2cReadBuffer(address, 7)
+            if (b.length < 7) b = pins.i2cReadBuffer(address, 6)
+            return b
+        })()
+        let line = "RAW("
+        line += buf.length.toString()
+        line += "):"
+        for (let i = 0; i < buf.length; i++) {
+            line += " " + buf[i].toString()
+        }
+        serial.writeLine(line)
+
+        const rawHum = ((buf[1] << 12) | (buf[2] << 4) | (buf[3] >> 4)) & 0xFFFFF
+        const rawTemp = (((buf[3] & 0x0F) << 16) | (buf[4] << 8) | buf[5]) & 0xFFFFF
+        const hum = Math.max(0, Math.min(100, (rawHum * 100) / 1048576))
+        const tempC = (rawTemp * 200) / 1048576 - 50
+        serial.writeLine("rawHum=" + rawHum + " rawTemp=" + rawTemp + " -> H=" + hum + "% T=" + tempC + "C")
     }
 }
