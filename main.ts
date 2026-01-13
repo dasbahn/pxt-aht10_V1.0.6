@@ -3,18 +3,33 @@ namespace AHT10 {
     let initialized = false
 
     function init() {
-        pins.i2cWriteNumber(0x38, 0xE1, NumberFormat.UInt8BE)
-        basic.pause(10)
+        let buf = pins.createBuffer(3)
+        buf[0] = 0xE1
+        buf[1] = 0x08
+        buf[2] = 0x00
+        pins.i2cWriteBuffer(0x38, buf)
+        basic.pause(40)
         initialized = true
     }
 
     function readRaw(): number[] {
         if (!initialized) init()
 
-        pins.i2cWriteNumber(0x38, 0xAC, NumberFormat.UInt8BE)
-        basic.pause(80)
+        let cmd = pins.createBuffer(3)
+        cmd[0] = 0xAC
+        cmd[1] = 0x33
+        cmd[2] = 0x00
+        pins.i2cWriteBuffer(0x38, cmd)
+
+        basic.pause(120)
 
         let buf = pins.i2cReadBuffer(0x38, 6)
+
+        // Fehlererkennung: Wenn alles 0 ist → ungültig
+        if (buf[1] == 0 && buf[2] == 0 && buf[3] == 0) {
+            return [0, 0, 0, 0, 0]
+        }
+
         return [buf[1], buf[2], buf[3], buf[4], buf[5]]
     }
 
@@ -25,35 +40,10 @@ namespace AHT10 {
         return (rawT * 200 / 1048576) - 50
     }
 
-    //% block="Temperatur (°F)"
-    export function temperatureF(): number {
-        return temperature() * 9 / 5 + 32
-    }
-
     //% block="Luftfeuchtigkeit (%)"
     export function humidity(): number {
         let r = readRaw()
         let rawH = (r[0] << 12) | (r[1] << 4) | (r[2] >> 4)
         return (rawH * 100) / 1048576
-    }
-
-    //% block="Taupunkt (°C)"
-    export function dewPoint(): number {
-        let T = temperature()
-        let RH = humidity()
-        let a = 17.27
-        let b = 237.7
-        let alpha = ((a * T) / (b + T)) + Math.log(RH / 100)
-        return (b * alpha) / (a - alpha)
-    }
-
-    //% block="Heat Index (°C)"
-    export function heatIndex(): number {
-        let T = temperature()
-        let RH = humidity()
-        return -8.784695 + 1.61139411 * T + 2.338549 * RH
-            - 0.14611605 * T * RH - 0.012308094 * T * T
-            - 0.016424828 * RH * RH + 0.002211732 * T * T * RH
-            + 0.00072546 * T * RH * RH - 0.000003582 * T * T * RH * RH
     }
 }
