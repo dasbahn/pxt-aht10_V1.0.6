@@ -1,7 +1,7 @@
 
 /**
  * AHT10-Erweiterung für MakeCode (micro:bit / Calliope mini)
- * Protokoll: I²C @ 0x38
+ * I²C-Adresse: 0x38 (dezimal 56)
  * Init:   0xE1 0x08 0x00 (+ optional Soft-Reset 0xBA)
  * Messung: 0xAC 0x33 0x00
  * Umrechnung:
@@ -15,10 +15,12 @@ namespace AHT10 {
     let _initialized = false
     let _address = DEFAULT_ADDR
 
-    // ---------- Low-Level I²C ----------
-    function i2cWrite(addr: number, data: number[]): void {
-        const buf = pins.createBuffer(data.length)
-        for (let i = 0; i < data.length; i++) buf[i] = data[i]
+    // ----------- Low-Level I²C -----------
+    function i2cWriteBytes(addr: number, b0: number, b1: number, b2: number): void {
+        const buf = pins.createBuffer(3)
+        buf[0] = b0
+        buf[1] = b1
+        buf[2] = b2
         pins.i2cWriteBuffer(addr, buf)
     }
 
@@ -26,18 +28,20 @@ namespace AHT10 {
         return pins.i2cReadBuffer(addr, len)
     }
 
-    // ---------- Init / Reset ----------
+    // ----------- Init / Reset -----------
     function initOnce(addr: number): void {
         if (_initialized && _address === addr) return
         _address = addr
 
-        // Soft-Reset (empfohlen nach Power-Up für konsistenten Zustand)
-        i2cWrite(_address, [0xBA])
+        // Soft-Reset (definierter Startzustand)
+        const sr = pins.createBuffer(1)
+        sr[0] = 0xBA
+        pins.i2cWriteBuffer(_address, sr)
         basic.pause(40)
 
-        // Init/Calibrate: 0xE1 0x08 0x00
-        i2cWrite(_address, [0xE1, 0x08, 0x00])
-        basic.pause(300) // leichte Reserve
+        // Init/Calibrate
+        i2cWriteBytes(_address, 0xE1, 0x08, 0x00)
+        basic.pause(300)
 
         _initialized = true
     }
@@ -47,65 +51,47 @@ namespace AHT10 {
     //% weight=95
     export function softReset(address: number = DEFAULT_ADDR): void {
         _address = address
-        i2cWrite(_address, [0xBA])
+        const sr = pins.createBuffer(1)
+        sr[0] = 0xBA
+        pins.i2cWriteBuffer(_address, sr)
         basic.pause(40)
         _initialized = false
         initOnce(_address)
     }
 
-    // ---------- Messung & Parsing ----------
+    // ----------- Messen & Parsen -----------
     /**
-     * Löst eine Messung aus und liest anschließend die Daten.
-     * Viele Breakouts liefern 7 Bytes (Byte6 = CRC). Wir akzeptieren 6 oder 7 und geben 6 Bytes zurück.
+     * Löst eine Messung aus, wartet bis Busy=0, liest 6 Bytes zurück.
+     * (Einige Module haben 7. Byte CRC; für die Auswertung nicht nötig.)
      */
-    function measureAndRead(addr: number): Buffer {
-        // Trigger measurement: 0xAC 0x33 0x00
-        i2cWrite(addr, [0xAC, 0x33, 0x00])
-        basic.pause(120) // etwas großzügiger (Calliope/micro:bit stabiler)
+    function measureAndRead6(addr: number): Buffer {
+        // Trigger
+        i2cWriteBytes(addr, 0xAC, 0x33, 0x00)
+        basic.pause(120)
 
-        // Polling Busy-Bit (Bit7 im Status-Byte) bis frei oder Timeout
+        // Busy-Polling (Bit7 im Status-Byte)
         for (let i = 0; i < 40; i++) {
-            // Versuche zuerst 7 Bytes (falls CRC vorhanden)
-            let buf = i2cRead(addr, 7)
-            if (buf.length < 7) {
-                // Fallback auf 6 Bytes, falls Gerät/Target nur 6 liefert
-                buf = i2cRead(addr, 6)
-            }
-
+            const buf = i2cRead(addr, 6)
             const status = buf[0]
             const busy = (status & 0x80) !== 0
             if (!busy) {
-                if (buf.length >= 7) {
-                    // Gib 6 Bytes (Status + 5 Daten) zurück; CRC ignorieren
-                    const out = pins.createBuffer(6)
-                    for (let j = 0; j < 6; j++) out[j] = buf[j]
-                    return out
-                }
-                return buf // bereits 6 Bytes
+                return buf
             }
-
             basic.pause(12)
         }
-
-        // Letzter Rückfall – gib das, was da ist
-        let last = i2cRead(addr, 7)
-        if (last.length >= 7) {
-            const out = pins.createBuffer(6)
-            for (let j = 0; j < 6; j++) out[j] = last[j]
-            return out
-        }
+        // Rückfall
         return i2cRead(addr, 6)
     }
 
     function parseRaw(buf: Buffer): { rawHum: number, rawTemp: number } {
-        // Rohfeuchte: 20 Bit aus buf[1], buf[2], high nibble von buf[3]
+        // Rohfeuchte: 20 Bit: buf[1], buf[2], high nibble buf[3]
         const rawHum = ((buf[1] << 12) | (buf[2] << 4) | (buf[3] >> 4)) & 0xFFFFF
-        // Rohtemp: 20 Bit aus low nibble von buf[3], buf[4], buf[5]
+        // Rohtemp: 20 Bit: low nibble buf[3], buf[4], buf[5]
         const rawTemp = (((buf[3] & 0x0F) << 16) | (buf[4] << 8) | buf[5]) & 0xFFFFF
         return { rawHum, rawTemp }
     }
 
-    // ---------- Öffentliche API / Blöcke ----------
+    // ----------- Öffentliche API / Blöcke -----------
     //% blockId=aht10_initialize block="AHT10 initialisieren an Adresse %address"
     //% address.defl=0x38 address.min=0 address.max=127
     //% weight=100
@@ -113,16 +99,6 @@ namespace AHT10 {
         initOnce(address)
     }
 
-    // (Debug) Status-Byte lesen – im Menü versteckt
-    //% blockId=aht10_status block="AHT10 Status-Byte an Adresse %address"
-    //% address.defl=0x38 address.min=0 address.max=127
-    //% blockHidden=true
-    export function readStatus(address: number = DEFAULT_ADDR): number {
-        const b = i2cRead(address, 1)
-        return b[0]
-    }
-
-    // *** FIX: kein "%" im Text, eindeutige blockId ***
     //% blockId=aht10_humidity_pct block="AHT10 Luftfeuchtigkeit in Prozent an Adresse %address"
     //% address.defl=0x38 address.min=0 address.max=127
     //% weight=90
@@ -130,15 +106,15 @@ namespace AHT10 {
         initOnce(address)
 
         // 1. Versuch
-        let buf = measureAndRead(address)
+        let buf = measureAndRead6(address)
         let raw = parseRaw(buf).rawHum
         let hum = (raw * 100) / 1048576
         hum = Math.max(0, Math.min(100, hum))
 
-        // 2. Versuch bei unplausiblen Werten (0% oder >100%)
+        // 2. Versuch bei unplausiblen Werten
         if (hum <= 0 || hum > 100) {
             basic.pause(100)
-            buf = measureAndRead(address)
+            buf = measureAndRead6(address)
             raw = parseRaw(buf).rawHum
             hum = (raw * 100) / 1048576
             hum = Math.max(0, Math.min(100, hum))
@@ -152,15 +128,13 @@ namespace AHT10 {
     export function temperatureC(address: number = DEFAULT_ADDR): number {
         initOnce(address)
 
-        // 1. Versuch
-        let buf = measureAndRead(address)
+        let buf = measureAndRead6(address)
         let raw = parseRaw(buf).rawTemp
         let tempC = (raw * 200) / 1048576 - 50
 
-        // 2. Versuch, wenn offensichtlich unplausibel
         if (tempC < -40 || tempC > 85) {
             basic.pause(100)
-            buf = measureAndRead(address)
+            buf = measureAndRead6(address)
             raw = parseRaw(buf).rawTemp
             tempC = (raw * 200) / 1048576 - 50
         }
@@ -176,7 +150,7 @@ namespace AHT10 {
     }
 
     /**
-     * Taupunkt (°C) via Magnus-Formel (Tetens) – gültig ~0..60 °C
+     * Taupunkt (°C) via Magnus-Formel (Tetens)
      */
     //% blockId=aht10_dewpoint_c block="AHT10 Taupunkt (°C) an Adresse %address"
     //% address.defl=0x38 address.min=0 address.max=127
@@ -184,7 +158,6 @@ namespace AHT10 {
     export function dewPointC(address: number = DEFAULT_ADDR): number {
         const t = temperatureC(address)
         const h = humidity(address)
-        // Konstanten für Wasser über flüssigem Wasser
         const a = 17.62
         const b = 243.12
         const gamma = (a * t) / (b + t) + Math.log(h / 100)
@@ -194,7 +167,6 @@ namespace AHT10 {
 
     /**
      * Heat Index (°C) auf Basis NOAA/Steadman
-     * Für T < ~26.7 °C (80°F) wird die einfache Approximation verwendet.
      */
     //% blockId=aht10_heatindex_c block="AHT10 Heat Index (°C) an Adresse %address"
     //% address.defl=0x38 address.min=0 address.max=127
@@ -202,7 +174,6 @@ namespace AHT10 {
     export function heatIndexC(address: number = DEFAULT_ADDR): number {
         const tC = temperatureC(address)
         const h = humidity(address)
-
         const tF = tC * 9 / 5 + 32
 
         if (tF < 80) {
@@ -221,7 +192,6 @@ namespace AHT10 {
             0.00085282 * tF * h * h +
             -0.00000199 * tF * tF * h * h
 
-        // NOAA-Korrekturen
         if (h < 13 && tF >= 80 && tF <= 112) {
             hiF += ((13 - h) / 4) * Math.sqrt((17 - Math.abs(tF - 95)) / 17)
         } else if (h > 85 && tF >= 80 && tF <= 87) {
@@ -232,52 +202,29 @@ namespace AHT10 {
     }
 
     /**
-     * Beide Werte lesen (nur JavaScript, kein Block)
+     * Beide Werte lesen (JS-Helfer, kein Block)
      */
     //% blockHidden=true
     export function readBoth(address: number = DEFAULT_ADDR): { humidity: number, temperatureC: number } {
         initOnce(address)
-        const buf = measureAndRead(address)
+        const buf = measureAndRead6(address)
         const raw = parseRaw(buf)
         const hum = Math.max(0, Math.min(100, (raw.rawHum * 100) / 1048576))
         const tempC = (raw.rawTemp * 200) / 1048576 - 50
         return { humidity: hum, temperatureC: tempC }
     }
 
-    // ----------- Optionale Debug-Helfer -----------
-    //% blockId=aht10_scan_i2c block="AHT10 I²C-Scan (0..127) und Adressen seriell ausgeben"
-    //% weight=10
-    export function scanI2C(): void {
-        for (let addr = 0; addr < 128; addr++) {
-            let ok = true
-            try {
-                const b = pins.i2cReadBuffer(addr, 1)
-            } catch (e) {
-                ok = false
-            }
-            if (ok) {
-                serial.writeLine("I2C device @ 0x" + addr.toString(16))
-            }
-            basic.pause(2)
-        }
-    }
-
+    /**
+     * Rohbytes zu Diagnosezwecken seriell ausgeben
+     */
     //% blockId=aht10_dump_raw block="AHT10 Rohbytes dumpen an Adresse %address"
     //% address.defl=0x38 address.min=0 address.max=127
     //% weight=9
     export function dumpRaw(address: number = DEFAULT_ADDR): void {
-        const buf = (function () {
-            pins.i2cWriteBuffer(address, pins.createBufferFromArray([0xAC, 0x33, 0x00]))
-            basic.pause(130)
-            let b = pins.i2cReadBuffer(address, 7)
-            if (b.length < 7) b = pins.i2cReadBuffer(address, 6)
-            return b
-        })()
-        let line = "RAW("
-        line += buf.length.toString()
-        line += "):"
+        const buf = measureAndRead6(address)
+        let line = "RAW(6):"
         for (let i = 0; i < buf.length; i++) {
-            line += " " + buf[i].toString()
+            line += " " + buf[i]
         }
         serial.writeLine(line)
 
@@ -287,3 +234,4 @@ namespace AHT10 {
         const tempC = (rawTemp * 200) / 1048576 - 50
         serial.writeLine("rawHum=" + rawHum + " rawTemp=" + rawTemp + " -> H=" + hum + "% T=" + tempC + "C")
     }
+}
