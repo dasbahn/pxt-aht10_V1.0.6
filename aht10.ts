@@ -1,8 +1,10 @@
 
 /**
- * AHT10-Erweiterung für micro:bit MakeCode
- * Protokoll: I²C 0x38, Init: 0xE1 0x08 0x00, Messung: 0xAC 0x33 0x00
- * Berechnung:
+ * AHT10-Erweiterung für MakeCode (micro:bit / Calliope mini)
+ * Protokoll: I²C @ 0x38
+ * Init:   0xE1 0x08 0x00 (+ optional Soft-Reset 0xBA)
+ * Messung: 0xAC 0x33 0x00
+ * Umrechnung:
  *   Feuchte(%) = rawHum * 100 / 2^20
  *   Temp(°C)   = rawTemp * 200 / 2^20 - 50
  */
@@ -13,142 +15,231 @@ namespace AHT10 {
     let _initialized = false
     let _address = DEFAULT_ADDR
 
-    /**
-     * Interne Hilfsfunktion: Sende einen Befehl (Buffer) an die I²C-Adresse
-     */
+    // ---------- Low-Level I²C ----------
     function i2cWrite(addr: number, data: number[]): void {
         const buf = pins.createBuffer(data.length)
         for (let i = 0; i < data.length; i++) buf[i] = data[i]
         pins.i2cWriteBuffer(addr, buf)
     }
 
-    /**
-     * Interne Hilfsfunktion: Lese einen Buffer von der I²C-Adresse
-     */
     function i2cRead(addr: number, len: number): Buffer {
         return pins.i2cReadBuffer(addr, len)
     }
 
-    /**
-     * Sensor initialisieren/kalibrieren (einmal pro Start ausreichend)
-     */
+    // ---------- Init / Reset ----------
     function initOnce(addr: number): void {
         if (_initialized && _address === addr) return
         _address = addr
+
+        // Soft-Reset (empfohlen nach Power-Up um einen definierten Zustand zu haben)
+        // 0xBA
+        i2cWrite(_address, [0xBA])
+        basic.pause(40)
+
         // Init/Calibrate: 0xE1 0x08 0x00
         i2cWrite(_address, [0xE1, 0x08, 0x00])
-        basic.pause(300)
+        basic.pause(300) // leicht großzügig
+
         _initialized = true
     }
 
-    /**
-     * Optional: Soft-Reset falls Sensor hängt
-     */
-    //% block="AHT10 Soft-Reset an Adresse %address"
+    //% blockId=aht10_soft_reset block="AHT10 Soft-Reset an Adresse %address"
     //% address.defl=0x38 address.min=0 address.max=127
+    //% weight=95
     export function softReset(address: number = DEFAULT_ADDR): void {
         _address = address
         i2cWrite(_address, [0xBA])
-        basic.pause(20)
+        basic.pause(40)
         _initialized = false
         initOnce(_address)
     }
 
+    // ---------- Messung & Parsing ----------
     /**
-     * Messung starten und Daten lesen; pollt Busy-Bit bis frei oder Timeout
+     * Löst eine Messung aus und liest anschließend die Daten.
+     * Viele Breakouts liefern 7 Bytes (Byte6 = CRC). Wir akzeptieren 6 oder 7 und geben 6 Bytes zurück.
      */
-    function read6Bytes(addr: number): Buffer {
+    function measureAndRead(addr: number): Buffer {
         // Trigger measurement: 0xAC 0x33 0x00
         i2cWrite(addr, [0xAC, 0x33, 0x00])
-        // typische Zeit: ~75–80 ms
-        basic.pause(80)
+        basic.pause(100) // Wartezeit bis Messung typischerweise fertig
 
-        // bis zu ~20 Versuche, Busy-Bit prüfen
-        for (let i = 0; i < 20; i++) {
-            const buf = i2cRead(addr, 6)
-            // Status im ersten Byte, Busy Bit = Bit 7
-            const status = buf[0]
-            if ((status & 0x80) === 0) {
-                return buf
+        // Polling Busy-Bit (Bit7 im Status-Byte) bis frei oder Timeout
+        for (let i = 0; i < 30; i++) {
+            // Versuche zuerst 7 Bytes (falls CRC vorhanden)
+            let buf = i2cRead(addr, 7)
+            if (buf.length < 7) {
+                // Fallback auf 6 Bytes, falls Gerät/Target nur 6 liefert
+                buf = i2cRead(addr, 6)
             }
+
+            const status = buf[0]
+            const busy = (status & 0x80) !== 0
+            if (!busy) {
+                if (buf.length >= 7) {
+                    // Gib 6 Bytes (Status + 5 Daten) zurück; CRC ignorieren
+                    const out = pins.createBuffer(6)
+                    for (let j = 0; j < 6; j++) out[j] = buf[j]
+                    return out
+                }
+                return buf // bereits 6 Bytes
+            }
+
             basic.pause(10)
         }
-        // letzter Versuch zurückgeben (kann Busy sein)
+
+        // Letzter Rückfall – gib das, was da ist
+        let last = i2cRead(addr, 7)
+        if (last.length >= 7) {
+            const out = pins.createBuffer(6)
+            for (let j = 0; j < 6; j++) out[j] = last[j]
+            return out
+        }
         return i2cRead(addr, 6)
     }
 
-    /**
-     * Aus den 6 Bytes Rohwerte extrahieren
-     */
     function parseRaw(buf: Buffer): { rawHum: number, rawTemp: number } {
-        // Rohfeuchte: Bits 0..19 über buf[1]..buf[3] (hohe Nibble)
+        // Rohfeuchte: 20 Bit aus buf[1], buf[2], high nibble von buf[3]
         const rawHum = ((buf[1] << 12) | (buf[2] << 4) | (buf[3] >> 4)) & 0xFFFFF
-        // Rohtemp: untere 4 Bits von buf[3], dann buf[4], buf[5]
+        // Rohtemp: 20 Bit aus low nibble von buf[3], buf[4], buf[5]
         const rawTemp = (((buf[3] & 0x0F) << 16) | (buf[4] << 8) | buf[5]) & 0xFFFFF
         return { rawHum, rawTemp }
     }
 
-    /**
-     * Initialisiert den Sensor (empfohlen im Start-Block)
-     */
-    //% block="AHT10 initialisieren an Adresse %address"
+    // ---------- Öffentliche API / Blöcke ----------
+    //% blockId=aht10_initialize block="AHT10 initialisieren an Adresse %address"
     //% address.defl=0x38 address.min=0 address.max=127
-    //% weight=90
+    //% weight=100
     export function initialize(address: number = DEFAULT_ADDR): void {
         initOnce(address)
     }
 
-    /**
-     * Liest die relative Luftfeuchtigkeit in Prozent (%)
-     */
-    //% block="AHT10 Luftfeuchtigkeit (%%) an Adresse %address"
+    //% blockId=aht10_status block="AHT10 Status-Byte an Adresse %address"
     //% address.defl=0x38 address.min=0 address.max=127
-    //% weight=80
-    export function humidity(address: number = DEFAULT_ADDR): number {
-        initOnce(address)
-        const buf = read6Bytes(address)
-        const raw = parseRaw(buf).rawHum
-        // Umrechnung: raw / 2^20 * 100
-        const hum = (raw * 100) / 1048576
-        return Math.max(0, Math.min(100, hum))
+    //% blockHidden=true
+    export function readStatus(address: number = DEFAULT_ADDR): number {
+        const b = i2cRead(address, 1)
+        return b[0]
     }
 
-    /**
-     * Liest die Temperatur in Grad Celsius (°C)
-     */
-    //% block="AHT10 Temperatur (°C) an Adresse %address"
+    //% blockId=aht10_humidity block="AHT10 Luftfeuchtigkeit (%%) an Adresse %address"
     //% address.defl=0x38 address.min=0 address.max=127
-    //% weight=70
+    //% weight=90
+    export function humidity(address: number = DEFAULT_ADDR): number {
+        initOnce(address)
+
+        // 1. Versuch
+        let buf = measureAndRead(address)
+        let raw = parseRaw(buf).rawHum
+        let hum = (raw * 100) / 1048576
+        hum = Math.max(0, Math.min(100, hum))
+
+        // 2. Versuch bei unplausiblen Werten (0% oder >100%)
+        if (hum <= 0 || hum > 100) {
+            basic.pause(60)
+            buf = measureAndRead(address)
+            raw = parseRaw(buf).rawHum
+            hum = (raw * 100) / 1048576
+            hum = Math.max(0, Math.min(100, hum))
+        }
+        return hum
+    }
+
+    //% blockId=aht10_temperature_c block="AHT10 Temperatur (°C) an Adresse %address"
+    //% address.defl=0x38 address.min=0 address.max=127
+    //% weight=85
     export function temperatureC(address: number = DEFAULT_ADDR): number {
         initOnce(address)
-        const buf = read6Bytes(address)
-        const raw = parseRaw(buf).rawTemp
-        // Umrechnung: raw / 2^20 * 200 - 50
-        const tempC = (raw * 200) / 1048576 - 50
+
+        // 1. Versuch
+        let buf = measureAndRead(address)
+        let raw = parseRaw(buf).rawTemp
+        let tempC = (raw * 200) / 1048576 - 50
+
+        // 2. Versuch, wenn offensichtlich unplausibel
+        if (tempC < -40 || tempC > 85) {
+            basic.pause(60)
+            buf = measureAndRead(address)
+            raw = parseRaw(buf).rawTemp
+            tempC = (raw * 200) / 1048576 - 50
+        }
         return tempC
     }
 
-    /**
-     * Liest die Temperatur in Grad Fahrenheit (°F)
-     */
-    //% block="AHT10 Temperatur (°F) an Adresse %address"
+    //% blockId=aht10_temperature_f block="AHT10 Temperatur (°F) an Adresse %address"
     //% address.defl=0x38 address.min=0 address.max=127
-    //% weight=60
+    //% weight=80
     export function temperatureF(address: number = DEFAULT_ADDR): number {
         const c = temperatureC(address)
         return c * 9 / 5 + 32
     }
 
     /**
-     * Lese beide Werte als Tupel (nur für JavaScript)
+     * Taupunkt (°C) via Magnus-Formel (Tetens) – gültig ~0..60 °C
+     */
+    //% blockId=aht10_dewpoint_c block="AHT10 Taupunkt (°C) an Adresse %address"
+    //% address.defl=0x38 address.min=0 address.max=127
+    //% weight=70
+    export function dewPointC(address: number = DEFAULT_ADDR): number {
+        const t = temperatureC(address)
+        const h = humidity(address)
+        // Konstanten für Wasser über flüssigem Wasser
+        const a = 17.62
+        const b = 243.12
+        const gamma = (a * t) / (b + t) + Math.log(h / 100)
+        const dew = (b * gamma) / (a - gamma)
+        return dew
+    }
+
+    /**
+     * Heat Index (°C) auf Basis NOAA/Steadman
+     * Für T < ~26.7 °C (80°F) wird die einfache Approximation verwendet.
+     */
+    //% blockId=aht10_heatindex_c block="AHT10 Heat Index (°C) an Adresse %address"
+    //% address.defl=0x38 address.min=0 address.max=127
+    //% weight=65
+    export function heatIndexC(address: number = DEFAULT_ADDR): number {
+        const tC = temperatureC(address)
+        const h = humidity(address)
+
+        const tF = tC * 9 / 5 + 32
+
+        if (tF < 80) {
+            const hiF = 0.5 * (tF + 61.0 + ((tF - 68.0) * 1.2) + (h * 0.094))
+            return (hiF - 32) * 5 / 9
+        }
+
+        let hiF =
+            -42.379 +
+            2.04901523 * tF +
+            10.14333127 * h +
+            -0.22475541 * tF * h +
+            -0.00683783 * tF * tF +
+            -0.05481717 * h * h +
+            0.00122874 * tF * tF * h +
+            0.00085282 * tF * h * h +
+            -0.00000199 * tF * tF * h * h
+
+        // NOAA-Korrekturen
+        if (h < 13 && tF >= 80 && tF <= 112) {
+            hiF += ((13 - h) / 4) * Math.sqrt((17 - Math.abs(tF - 95)) / 17)
+        } else if (h > 85 && tF >= 80 && tF <= 87) {
+            hiF += ((h - 85) / 10) * ((87 - tF) / 5)
+        }
+
+        return (hiF - 32) * 5 / 9
+    }
+
+    /**
+     * Beide Werte lesen (nur JavaScript, kein Block)
      */
     //% blockHidden=true
     export function readBoth(address: number = DEFAULT_ADDR): { humidity: number, temperatureC: number } {
         initOnce(address)
-        const buf = read6Bytes(address)
+        const buf = measureAndRead(address)
         const raw = parseRaw(buf)
-        const hum = (raw.rawHum * 100) / 1048576
+        const hum = Math.max(0, Math.min(100, (raw.rawHum * 100) / 1048576))
         const tempC = (raw.rawTemp * 200) / 1048576 - 50
-        return { humidity: Math.max(0, Math.min(100, hum)), temperatureC: tempC }
+        return { humidity: hum, temperatureC: tempC }
     }
 }
